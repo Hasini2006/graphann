@@ -48,19 +48,34 @@ class VamanaIndex {
     uint32_t get_dim()  const { return dim_; }
 
   private:
-    using Candidate = std::pair<float, uint32_t>;
+    // --------------------------------------------------------
+    // REPLACED the old std::pair with this custom struct. 
+    // This allows std::set to handle custom sorting safely.
+    // --------------------------------------------------------
+    struct Candidate {
+        float first;     // distance
+        uint32_t second; // id
+        bool operator<(const Candidate& other) const {
+            if (first != other.first) return first < other.first;
+            return second < other.second;
+        }
+    };
 
-    // Accepts an optional list of starting nodes for Pass 2 Warm-Start
+    // --------------------------------------------------------
+    // SINGLE declaration of greedy_search with adaptive L logic
+    // --------------------------------------------------------
     std::pair<std::vector<Candidate>, uint32_t>
-    greedy_search(const float* query, uint32_t L, const std::vector<uint32_t>& init_nodes = {}) const;
+    greedy_search(const float* query, uint32_t L_initial, 
+                  const std::vector<uint32_t>& init_nodes = {},
+                  uint32_t L_max = 0) const;
 
     std::vector<uint32_t> robust_prune(uint32_t node, std::vector<Candidate>& candidates,
                                        float alpha, uint32_t R);
 
-    float* data_    = nullptr;
+    float* data_      = nullptr;
     uint32_t npts_    = 0;
     uint32_t dim_     = 0;
-    bool     owns_data_ = false;
+    bool   owns_data_ = false;
 
     std::vector<std::vector<uint32_t>> graph_;
     uint32_t start_node_ = 0;

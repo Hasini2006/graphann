@@ -29,38 +29,68 @@ VamanaIndex::~VamanaIndex() {
 // ============================================================================
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
-VamanaIndex::greedy_search(const float* query, uint32_t L, const std::vector<uint32_t>& init_nodes) const {
+VamanaIndex::greedy_search(const float* query, uint32_t L_initial, 
+                              const std::vector<uint32_t>& init_nodes,
+                              uint32_t L_max) const {
+    
     std::set<Candidate> candidate_set;
     std::vector<bool> visited(npts_, false);
-    uint32_t dist_cmps = 0;
     std::set<uint32_t> expanded;
+    uint32_t dist_cmps = 0;
+    
+    uint32_t current_L = L_initial;
+    bool adaptive = (L_max > L_initial);
+    
+    // Stagnation tracking
+    float best_dist = std::numeric_limits<float>::max();
+    uint32_t stagnation_count = 0;
+    const uint32_t STAGNATION_THRESHOLD = 5; // Adjust based on dim/dataset
 
-    // ALGORITHMIC UPGRADE: Warm-Start Initialization
+    // --- Initialization ---
     if (init_nodes.empty()) {
-        float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
+        float d = compute_l2sq(query, get_vector(start_node_), dim_);
         dist_cmps++;
-        candidate_set.insert({start_dist, start_node_});
+        candidate_set.insert({d, start_node_});
         visited[start_node_] = true;
     } else {
         for (uint32_t id : init_nodes) {
-            if (!visited[id]) {
-                float d = compute_l2sq(query, get_vector(id), dim_);
-                dist_cmps++;
-                candidate_set.insert({d, id});
-                visited[id] = true;
-            }
+            float d = compute_l2sq(query, get_vector(id), dim_);
+            dist_cmps++;
+            candidate_set.insert({d, id});
+            visited[id] = true;
         }
     }
 
+    // --- Search Loop ---
     while (true) {
         uint32_t best_node = UINT32_MAX;
-        for (const auto& [dist, id] : candidate_set) {
-            if (expanded.find(id) == expanded.end()) {
-                best_node = id;
+        float current_best_dist = std::numeric_limits<float>::max();
+
+        for (const auto& cand : candidate_set) {
+            if (expanded.find(cand.second) == expanded.end()) {
+                best_node = cand.second;
+                current_best_dist = cand.first;
                 break;
             }
         }
+
         if (best_node == UINT32_MAX) break;
+
+        // ADAPTIVE LOGIC: Check for stagnation
+        if (adaptive) {
+            if (current_best_dist < best_dist) {
+                best_dist = current_best_dist;
+                stagnation_count = 0;
+            } else {
+                stagnation_count++;
+            }
+
+            // If we've hit a plateau, expand the beam width to escape local minima
+            if (stagnation_count >= STAGNATION_THRESHOLD && current_L < L_max) {
+                current_L = std::min(L_max, (uint32_t)(current_L * 1.5)); 
+                stagnation_count = 0; // Reset after expansion
+            }
+        }
 
         expanded.insert(best_node);
 
@@ -72,10 +102,9 @@ VamanaIndex::greedy_search(const float* query, uint32_t L, const std::vector<uin
         }
 
         for (size_t i = 0; i < neighbors.size(); i++) {
-            // HARDWARE UPGRADE: Memory Prefetching
-            // Fetch the vector 2 hops ahead into the CPU cache before we need it
+            // NEON/ARM Prefetching
             if (i + 2 < neighbors.size()) {
-                __builtin_prefetch(get_vector(neighbors[i + 2]), 0, 1);
+                __builtin_prefetch(get_vector(neighbors[i + 2]), 0, 3);
             }
 
             uint32_t nbr = neighbors[i];
@@ -85,7 +114,7 @@ VamanaIndex::greedy_search(const float* query, uint32_t L, const std::vector<uin
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
 
-            if (candidate_set.size() < L) {
+            if (candidate_set.size() < current_L) {
                 candidate_set.insert({d, nbr});
             } else {
                 auto worst = std::prev(candidate_set.end());
@@ -294,17 +323,16 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
 // ============================================================================
 
 SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
-    if (L < K) L = K;
-
+    uint32_t L_initial = std::max(K, L / 2); // Start with half the beam width
+    uint32_t L_max = std::max(K, L);        // Caps at the original L
+    
     Timer t;
-    auto [candidates, dist_cmps] = greedy_search(query, L, {});
+    auto [candidates, dist_cmps] = greedy_search(query, L_initial, {}, L_max);
     double latency = t.elapsed_us();
 
-    // Return top-K results
     SearchResult result;
     result.dist_cmps = dist_cmps;
     result.latency_us = latency;
-    result.ids.reserve(K);
     for (uint32_t i = 0; i < K && i < candidates.size(); i++) {
         result.ids.push_back(candidates[i].second);
     }
