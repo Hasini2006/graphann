@@ -68,8 +68,10 @@ class VamanaIndex {
 
     // Alpha-RNG pruning: selects a diverse subset of candidates as neighbors.
     // Modifies graph_[node] in place. Candidates should NOT include node itself.
-    void robust_prune(uint32_t node, std::vector<Candidate>& candidates,
-                      float alpha, uint32_t R);
+    // void robust_prune(uint32_t node, std::vector<Candidate>& candidates,
+    //                   float alpha, uint32_t R);
+    std::vector<uint32_t> robust_prune(uint32_t node, std::vector<Candidate>& candidates,
+                                       float alpha, uint32_t R);
 
     // ---- Data ----
     float*   data_    = nullptr;  // contiguous row-major [npts x dim], aligned

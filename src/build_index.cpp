@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <cstdlib>
+#include <stdexcept>
 
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
@@ -27,7 +28,7 @@ int main(int argc, char** argv) {
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc)       data_path = argv[++i];
+        if (arg == "--data" && i + 1 < argc)        data_path = argv[++i];
         else if (arg == "--output" && i + 1 < argc) output_path = argv[++i];
         else if (arg == "--R" && i + 1 < argc)      R = std::atoi(argv[++i]);
         else if (arg == "--L" && i + 1 < argc)      L = std::atoi(argv[++i]);
@@ -44,22 +45,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "=== Vamana Index Builder ===" << std::endl;
-    std::cout << "Parameters:" << std::endl;
-    std::cout << "  R     = " << R << std::endl;
-    std::cout << "  L     = " << L << std::endl;
-    std::cout << "  alpha = " << alpha << std::endl;
-    std::cout << "  gamma = " << gamma << std::endl;
+    try {
+        std::cout << "=== Vamana Index Builder (2-Pass Version) ===" << std::endl;
+        std::cout << "Parameters:" << std::endl;
+        std::cout << "  R     = " << R << std::endl;
+        std::cout << "  L     = " << L << std::endl;
+        std::cout << "  alpha = " << alpha << std::endl;
+        std::cout << "  gamma = " << gamma << std::endl;
 
-    VamanaIndex index;
+        VamanaIndex index;
 
-    Timer total_timer;
-    index.build(data_path, R, L, alpha, gamma);
-    double total_time = total_timer.elapsed_seconds();
+        Timer total_timer;
+        
+        // We only call build ONCE. 
+        // The VamanaIndex::build method now loops internally for the two passes.
+        index.build(data_path, R, L, alpha, gamma);
+        
+        double total_time = total_timer.elapsed_seconds();
 
-    std::cout << "\nTotal build time: " << total_time << " seconds" << std::endl;
+        std::cout << "\nTotal multi-pass build time: " << total_time << " seconds" << std::endl;
 
-    index.save(output_path);
-    std::cout << "Done." << std::endl;
+        index.save(output_path);
+        std::cout << "Done." << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "\n[FATAL ERROR]: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "\n[FATAL ERROR]: An unknown exception occurred during index build." << std::endl;
+        return 1;
+    }
+
     return 0;
 }

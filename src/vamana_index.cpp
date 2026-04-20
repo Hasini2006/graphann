@@ -115,8 +115,47 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
 // This ensures good graph navigability by keeping some long-range edges
 // (alpha > 1 makes it easier for a candidate to survive pruning).
 
-void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
-                               float alpha, uint32_t R) {
+// void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
+//                                float alpha, uint32_t R) {
+//     // Remove self from candidates if present
+//     candidates.erase(
+//         std::remove_if(candidates.begin(), candidates.end(),
+//                        [node](const Candidate& c) { return c.second == node; }),
+//         candidates.end());
+
+//     // Sort by distance to node (ascending)
+//     std::sort(candidates.begin(), candidates.end());
+
+//     std::vector<uint32_t> new_neighbors;
+//     new_neighbors.reserve(R);
+
+//     for (const auto& [dist_to_node, cand_id] : candidates) {
+//         if (new_neighbors.size() >= R)
+//             break;
+
+//         // Check alpha-RNG condition against all already-selected neighbors
+//         bool keep = true;
+//         for (uint32_t selected : new_neighbors) {
+//             float dist_cand_to_selected =
+//                 compute_l2sq(get_vector(cand_id), get_vector(selected), dim_);
+//             if (dist_to_node > alpha * dist_cand_to_selected) {
+//                 keep = false;
+//                 break;
+//             }
+//         }
+
+//         if (keep)
+//             new_neighbors.push_back(cand_id);
+//     }
+
+//     graph_[node] = std::move(new_neighbors);
+// }
+// ============================================================================
+// Robust Prune (Alpha-RNG Rule)
+// ============================================================================
+
+std::vector<uint32_t> VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
+                                                float alpha, uint32_t R) {
     // Remove self from candidates if present
     candidates.erase(
         std::remove_if(candidates.begin(), candidates.end(),
@@ -125,6 +164,14 @@ void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates
 
     // Sort by distance to node (ascending)
     std::sort(candidates.begin(), candidates.end());
+
+    // Deduplicate by node ID (crucial for Pass 2 where candidates may merge with existing edges)
+    candidates.erase(
+        std::unique(candidates.begin(), candidates.end(),
+                    [](const Candidate& a, const Candidate& b) {
+                        return a.second == b.second;
+                    }),
+        candidates.end());
 
     std::vector<uint32_t> new_neighbors;
     new_neighbors.reserve(R);
@@ -148,11 +195,110 @@ void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates
             new_neighbors.push_back(cand_id);
     }
 
-    graph_[node] = std::move(new_neighbors);
+    // Return the edges instead of mutating graph_[node] directly
+    return new_neighbors;
 }
 
 // ============================================================================
 // Build
+// ============================================================================
+
+// void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
+//                         float alpha, float gamma) {
+//     // --- Load data ---
+//     std::cout << "Loading data from " << data_path << "..." << std::endl;
+//     FloatMatrix mat = load_fbin(data_path);
+//     npts_ = mat.npts;
+//     dim_  = mat.dims;
+//     data_ = mat.data.release();
+//     owns_data_ = true;
+
+//     std::cout << "  Points: " << npts_ << ", Dimensions: " << dim_ << std::endl;
+
+//     if (L < R) {
+//         std::cerr << "Warning: L (" << L << ") < R (" << R
+//                   << "). Setting L = R." << std::endl;
+//         L = R;
+//     }
+
+//     // --- Initialize empty graph and per-node locks ---
+//     graph_.resize(npts_);
+//     locks_ = std::vector<std::mutex>(npts_);
+
+//     // --- Pick random start node ---
+//     std::mt19937 rng(42);  // fixed seed for reproducibility
+//     start_node_ = rng() % npts_;
+//     std::cout << "  Start node: " << start_node_ << std::endl;
+
+//     // --- Create random insertion order ---
+//     std::vector<uint32_t> perm(npts_);
+//     std::iota(perm.begin(), perm.end(), 0);
+//     std::shuffle(perm.begin(), perm.end(), rng);
+
+//     // --- Build graph: parallel insertion with per-node locking ---
+//     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
+//     std::cout << "Building index (R=" << R << ", L=" << L
+//               << ", alpha=" << alpha << ", gamma=" << gamma
+//               << ", gammaR=" << gamma_R << ")..." << std::endl;
+
+//     Timer build_timer;
+
+//     #pragma omp parallel for schedule(dynamic, 64)
+//     for (size_t idx = 0; idx < npts_; idx++) {
+//         uint32_t point = perm[idx];
+
+//         // Step 1: Search for this point in the current graph to find candidates
+//         auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
+
+//         // Step 2: Prune candidates to get this point's neighbors
+//         // We don't need to lock graph_[point] here because each point appears
+//         // exactly once in the permutation — only this thread writes to it now.
+//         robust_prune(point, candidates, alpha, R);
+
+//         // Step 3: Add backward edges from each new neighbor back to this point
+//         for (uint32_t nbr : graph_[point]) {
+//             std::lock_guard<std::mutex> lock(locks_[nbr]);
+
+//             // Add backward edge
+//             graph_[nbr].push_back(point);
+
+//             // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
+//             if (graph_[nbr].size() > gamma_R) {
+//                 // Build candidate list from current neighbors of nbr
+//                 std::vector<Candidate> nbr_candidates;
+//                 nbr_candidates.reserve(graph_[nbr].size());
+//                 for (uint32_t nn : graph_[nbr]) {
+//                     float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
+//                     nbr_candidates.push_back({d, nn});
+//                 }
+//                 robust_prune(nbr, nbr_candidates, alpha, R);
+//             }
+//         }
+
+//         // Progress reporting (from one thread only)
+//         if (idx % 10000 == 0) {
+//             #pragma omp critical
+//             {
+//                 std::cout << "\r  Inserted " << idx << " / " << npts_
+//                           << " points" << std::flush;
+//             }
+//         }
+//     }
+
+//     double build_time = build_timer.elapsed_seconds();
+
+//     // Compute average degree
+//     size_t total_edges = 0;
+//     for (uint32_t i = 0; i < npts_; i++)
+//         total_edges += graph_[i].size();
+//     double avg_degree = (double)total_edges / npts_;
+
+//     std::cout << "\n  Build complete in " << build_time << " seconds."
+//               << std::endl;
+//     std::cout << "  Average out-degree: " << avg_degree << std::endl;
+// }
+// ============================================================================
+// Build (2-Pass Implementation)
 // ============================================================================
 
 void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
@@ -178,63 +324,87 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     locks_ = std::vector<std::mutex>(npts_);
 
     // --- Pick random start node ---
-    std::mt19937 rng(42);  // fixed seed for reproducibility
+    std::mt19937 rng(42);
     start_node_ = rng() % npts_;
     std::cout << "  Start node: " << start_node_ << std::endl;
 
-    // --- Create random insertion order ---
-    std::vector<uint32_t> perm(npts_);
-    std::iota(perm.begin(), perm.end(), 0);
-    std::shuffle(perm.begin(), perm.end(), rng);
-
-    // --- Build graph: parallel insertion with per-node locking ---
     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-    std::cout << "Building index (R=" << R << ", L=" << L
-              << ", alpha=" << alpha << ", gamma=" << gamma
-              << ", gammaR=" << gamma_R << ")..." << std::endl;
-
     Timer build_timer;
 
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (size_t idx = 0; idx < npts_; idx++) {
-        uint32_t point = perm[idx];
+    // --- 2-Pass Build Loop ---
+    for (int pass = 1; pass <= 2; pass++) {
+        std::cout << "\nStarting Pass " << pass << " of 2..." << std::endl;
+        
+        // DiskANN best practice: Use alpha=1.0 for the first pass, provided alpha for the second.
+        float current_alpha = (pass == 1) ? 1.0f : alpha;
+        std::cout << "  Using alpha = " << current_alpha << std::endl;
 
-        // Step 1: Search for this point in the current graph to find candidates
-        auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
+        // Generate a fresh random insertion order for this pass
+        std::vector<uint32_t> perm(npts_);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
 
-        // Step 2: Prune candidates to get this point's neighbors
-        // We don't need to lock graph_[point] here because each point appears
-        // exactly once in the permutation — only this thread writes to it now.
-        robust_prune(point, candidates, alpha, R);
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (size_t idx = 0; idx < npts_; idx++) {
+            uint32_t point = perm[idx];
 
-        // Step 3: Add backward edges from each new neighbor back to this point
-        for (uint32_t nbr : graph_[point]) {
-            std::lock_guard<std::mutex> lock(locks_[nbr]);
+            // Step 1: Search for this point to find candidates
+            auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
 
-            // Add backward edge
-            graph_[nbr].push_back(point);
-
-            // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
-            if (graph_[nbr].size() > gamma_R) {
-                // Build candidate list from current neighbors of nbr
-                std::vector<Candidate> nbr_candidates;
-                nbr_candidates.reserve(graph_[nbr].size());
-                for (uint32_t nn : graph_[nbr]) {
-                    float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
-                    nbr_candidates.push_back({d, nn});
+            // In Pass 2, augment candidates with the node's existing neighbors
+            if (pass == 2) {
+                std::vector<uint32_t> existing_nbrs;
+                {
+                    std::lock_guard<std::mutex> lock(locks_[point]);
+                    existing_nbrs = graph_[point];
                 }
-                robust_prune(nbr, nbr_candidates, alpha, R);
+                for (uint32_t nbr : existing_nbrs) {
+                    float d = compute_l2sq(get_vector(point), get_vector(nbr), dim_);
+                    candidates.push_back({d, nbr});
+                }
             }
-        }
 
-        // Progress reporting (from one thread only)
-        if (idx % 10000 == 0) {
-            #pragma omp critical
+            // Step 2: Prune candidates to get the new out-edges
+            std::vector<uint32_t> new_edges = robust_prune(point, candidates, current_alpha, R);
+
+            // Safely assign new edges to the graph under a lock (crucial for Pass 2)
             {
-                std::cout << "\r  Inserted " << idx << " / " << npts_
-                          << " points" << std::flush;
+                std::lock_guard<std::mutex> lock(locks_[point]);
+                graph_[point] = new_edges;
+            }
+
+            // Step 3: Add backward edges from each new neighbor back to this point
+            for (uint32_t nbr : new_edges) {
+                std::lock_guard<std::mutex> lock(locks_[nbr]);
+
+                // Prevent duplicate backward edges
+                if (std::find(graph_[nbr].begin(), graph_[nbr].end(), point) == graph_[nbr].end()) {
+                    graph_[nbr].push_back(point);
+                }
+
+                // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
+                if (graph_[nbr].size() > gamma_R) {
+                    std::vector<Candidate> nbr_candidates;
+                    nbr_candidates.reserve(graph_[nbr].size());
+                    for (uint32_t nn : graph_[nbr]) {
+                        float d = compute_l2sq(get_vector(nbr), get_vector(nn), dim_);
+                        nbr_candidates.push_back({d, nn});
+                    }
+                    // Safely reassign pruned edges
+                    graph_[nbr] = robust_prune(nbr, nbr_candidates, current_alpha, R);
+                }
+            }
+
+            // Progress reporting
+            if (idx % 10000 == 0) {
+                #pragma omp critical
+                {
+                    std::cout << "\r  Pass " << pass << " - Inserted " << idx << " / " << npts_
+                              << " points" << std::flush;
+                }
             }
         }
+        std::cout << "\r  Pass " << pass << " - Inserted " << npts_ << " / " << npts_ << " points" << std::endl;
     }
 
     double build_time = build_timer.elapsed_seconds();
@@ -245,8 +415,7 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
         total_edges += graph_[i].size();
     double avg_degree = (double)total_edges / npts_;
 
-    std::cout << "\n  Build complete in " << build_time << " seconds."
-              << std::endl;
+    std::cout << "\n  Build complete in " << build_time << " seconds." << std::endl;
     std::cout << "  Average out-degree: " << avg_degree << std::endl;
 }
 
