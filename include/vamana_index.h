@@ -39,7 +39,7 @@ class VamanaIndex {
     void build(const std::string& data_path, uint32_t R, uint32_t L,
                float alpha, float gamma);
 
-    SearchResult search(const float* query, uint32_t K, uint32_t L) const;
+    SearchResult search(const float* query, uint32_t K, uint32_t L_initial, uint32_t L_max) const;
 
     void save(const std::string& path) const;
     void load(const std::string& index_path, const std::string& data_path);

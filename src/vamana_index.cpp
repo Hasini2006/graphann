@@ -28,71 +28,68 @@ VamanaIndex::~VamanaIndex() {
 // Greedy Search (With Prefetching & Warm-Start)
 // ============================================================================
 
+// ============================================================================
+// Greedy Search (Adaptive Beam Length + Prefetching + Warm-Start)
+// ============================================================================
+
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
 VamanaIndex::greedy_search(const float* query, uint32_t L_initial, 
-                              const std::vector<uint32_t>& init_nodes,
-                              uint32_t L_max) const {
+                           const std::vector<uint32_t>& init_nodes, 
+                           uint32_t L_max) const {
     
+    // If L_max wasn't provided, default it to L_initial (for standard build phase)
+    if (L_max == 0 || L_max < L_initial) L_max = L_initial;
+
     std::set<Candidate> candidate_set;
     std::vector<bool> visited(npts_, false);
-    std::set<uint32_t> expanded;
     uint32_t dist_cmps = 0;
-    
-    uint32_t current_L = L_initial;
-    bool adaptive = (L_max > L_initial);
-    
-    // Stagnation tracking
-    float best_dist = std::numeric_limits<float>::max();
-    uint32_t stagnation_count = 0;
-    const uint32_t STAGNATION_THRESHOLD = 5; // Adjust based on dim/dataset
+    std::set<uint32_t> expanded;
 
-    // --- Initialization ---
+    // Warm-Start Initialization
     if (init_nodes.empty()) {
-        float d = compute_l2sq(query, get_vector(start_node_), dim_);
+        float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
         dist_cmps++;
-        candidate_set.insert({d, start_node_});
+        candidate_set.insert({start_dist, start_node_});
         visited[start_node_] = true;
     } else {
         for (uint32_t id : init_nodes) {
-            float d = compute_l2sq(query, get_vector(id), dim_);
-            dist_cmps++;
-            candidate_set.insert({d, id});
-            visited[id] = true;
+            if (!visited[id]) {
+                float d = compute_l2sq(query, get_vector(id), dim_);
+                dist_cmps++;
+                candidate_set.insert({d, id});
+                visited[id] = true;
+            }
         }
     }
 
-    // --- Search Loop ---
-    while (true) {
-        uint32_t best_node = UINT32_MAX;
-        float current_best_dist = std::numeric_limits<float>::max();
+    uint32_t current_expansion_limit = L_initial;
+    uint32_t expansion_count = 0;
 
-        for (const auto& cand : candidate_set) {
-            if (expanded.find(cand.second) == expanded.end()) {
-                best_node = cand.second;
-                current_best_dist = cand.first;
+    while (true) {
+        // 1. Trap Detection: Have we hit our current expansion limit?
+        if (expansion_count >= current_expansion_limit) {
+            // We hit the limit. But are we stuck?
+            // If we haven't reached the absolute L_max, we trigger the escape hatch!
+            if (current_expansion_limit < L_max) {
+                current_expansion_limit = L_max; // Widen the beam!
+            } else {
+                break; // We hit the hard L_max limit. Stop searching.
+            }
+        }
+
+        uint32_t best_node = UINT32_MAX;
+        for (const auto& [dist, id] : candidate_set) {
+            if (expanded.find(id) == expanded.end()) {
+                best_node = id;
                 break;
             }
         }
-
+        
+        // If no more unvisited nodes exist in our pocket, we are done.
         if (best_node == UINT32_MAX) break;
 
-        // ADAPTIVE LOGIC: Check for stagnation
-        if (adaptive) {
-            if (current_best_dist < best_dist) {
-                best_dist = current_best_dist;
-                stagnation_count = 0;
-            } else {
-                stagnation_count++;
-            }
-
-            // If we've hit a plateau, expand the beam width to escape local minima
-            if (stagnation_count >= STAGNATION_THRESHOLD && current_L < L_max) {
-                current_L = std::min(L_max, (uint32_t)(current_L * 1.5)); 
-                stagnation_count = 0; // Reset after expansion
-            }
-        }
-
         expanded.insert(best_node);
+        expansion_count++;
 
         std::vector<uint32_t> neighbors;
         {
@@ -102,9 +99,9 @@ VamanaIndex::greedy_search(const float* query, uint32_t L_initial,
         }
 
         for (size_t i = 0; i < neighbors.size(); i++) {
-            // NEON/ARM Prefetching
+            // Memory Prefetching
             if (i + 2 < neighbors.size()) {
-                __builtin_prefetch(get_vector(neighbors[i + 2]), 0, 3);
+                __builtin_prefetch(get_vector(neighbors[i + 2]), 0, 1);
             }
 
             uint32_t nbr = neighbors[i];
@@ -114,7 +111,9 @@ VamanaIndex::greedy_search(const float* query, uint32_t L_initial,
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
 
-            if (candidate_set.size() < current_L) {
+            // Notice we use L_max here, so we don't accidentally throw away 
+            // nodes that we might need if the trap is triggered later!
+            if (candidate_set.size() < L_max) {
                 candidate_set.insert({d, nbr});
             } else {
                 auto worst = std::prev(candidate_set.end());
@@ -129,7 +128,6 @@ VamanaIndex::greedy_search(const float* query, uint32_t L_initial,
     std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
     return {results, dist_cmps};
 }
-
 // ============================================================================
 // Robust Prune (Alpha-RNG Rule)
 // ============================================================================
@@ -322,17 +320,24 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
 // Search
 // ============================================================================
 
-SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
-    uint32_t L_initial = std::max(K, L / 2); // Start with half the beam width
-    uint32_t L_max = std::max(K, L);        // Caps at the original L
+// ============================================================================
+// Search (Adaptive Beam Length)
+// ============================================================================
+
+SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L_initial, uint32_t L_max) const {
+    // Safety checks: Ensure beams are at least as large as K, and L_max >= L_initial
+    if (L_initial < K) L_initial = K;
+    if (L_max < L_initial) L_max = L_initial;
     
     Timer t;
+    // Pass the adaptive parameters straight into the engine
     auto [candidates, dist_cmps] = greedy_search(query, L_initial, {}, L_max);
     double latency = t.elapsed_us();
 
     SearchResult result;
     result.dist_cmps = dist_cmps;
     result.latency_us = latency;
+    result.ids.reserve(K);
     for (uint32_t i = 0; i < K && i < candidates.size(); i++) {
         result.ids.push_back(candidates[i].second);
     }
